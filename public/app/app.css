@@ -5,6 +5,8 @@
   display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 16px;
   padding: 16px 32px; border-bottom: 1px solid var(--line);
   background: var(--header-bg); backdrop-filter: blur(6px);
+  /* шапка — слой выше плеера и чата, чтобы меню темы открывалось поверх них */
+  position: relative; z-index: 30;
 }
 .brand { display: flex; align-items: center; gap: 12px; }
 .brand-mark {

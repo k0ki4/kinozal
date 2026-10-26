@@ -1,0 +1,7 @@
+node_modules/
+data/
+# файлы с паролями и ключами — на GitHub не нужны
+.env
+*.env
+*.env.txt
+!.env.example

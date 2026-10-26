@@ -1,0 +1,8 @@
+# Замени адрес на свой домен. Caddy сам получит https-сертификат.
+nashkino.duckdns.org {
+	encode gzip
+	request_body {
+		max_size 5GB
+	}
+	reverse_proxy 127.0.0.1:3000
+}

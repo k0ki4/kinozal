@@ -1,0 +1,21 @@
+[Unit]
+Description=Наш кинозал
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=kinozal
+WorkingDirectory=/opt/kinozal
+ExecStart=/usr/bin/node /opt/kinozal/server.js
+Restart=always
+RestartSec=3
+Environment=NODE_ENV=production
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

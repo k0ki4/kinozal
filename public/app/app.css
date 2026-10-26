@@ -154,6 +154,31 @@
 .last-action { flex: 1 1 160px; font-size: 13px; color: var(--muted); text-align: center; }
 .vol-ic { color: var(--text-2); }
 
+/* ── Настройки видео ── */
+.cc-wrap { position: relative; }
+#setBtn[aria-expanded="true"] { color: var(--accent); }
+.cc-menu {
+  position: absolute; right: 0; bottom: 52px; z-index: 10;
+  width: 260px; max-width: calc(100vw - 32px); max-height: 360px; overflow-y: auto; padding: 6px;
+  background: var(--surface); border: 1px solid var(--line-strong); border-radius: 12px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, .45);
+}
+.cc-title { padding: 6px 12px 4px; font-size: 12px; font-weight: 700; color: var(--muted); }
+.cc-title + .cc-item { margin-top: 0; }
+.cc-sep { height: 1px; margin: 6px 4px; background: var(--line); }
+.yt-controls-note {
+  position: absolute; left: 14px; bottom: 56px; max-width: calc(100% - 28px);
+  padding: 6px 12px; border-radius: 10px; background: rgba(26, 16, 10, .85);
+  font-size: 12px; color: var(--text-2); pointer-events: none;
+}
+.cc-item {
+  display: flex; align-items: center; gap: 8px; width: 100%; min-height: 40px; padding: 0 12px;
+  border: 0; border-radius: 8px; background: transparent; color: var(--text); text-align: left; font-size: 14px;
+}
+.cc-item:hover { background: var(--surface-3); }
+.cc-item[aria-checked="true"] { color: var(--accent); font-weight: 700; }
+.cc-note { padding: 6px 12px; font-size: 12px; color: var(--muted); }
+
 input[type="range"] {
   -webkit-appearance: none; appearance: none; background: transparent; cursor: pointer; margin: 0;
 }

@@ -31,6 +31,15 @@ const YTDLP_COOKIES = process.env.YTDLP_COOKIES || '';
 const YTDLP_JS_RUNTIME = process.env.YTDLP_JS_RUNTIME || '';
 const YTDLP_FORMAT = process.env.YTDLP_FORMAT || 'bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b';
 const YTDLP_FORMAT_OTHER = process.env.YTDLP_FORMAT_OTHER || 'bv*[height<=1080]+ba/b[height<=1080]/b';
+// Язык звука, если у ролика несколько дорожек (ru, en, ja…). Пусто — оригинальная дорожка.
+const YTDLP_AUDIO_LANG = /^[a-z]{2,3}(-[A-Za-z0-9]{1,8})?$/.test(process.env.YTDLP_AUDIO_LANG || '') ? process.env.YTDLP_AUDIO_LANG : '';
+function formatFor(kind) {
+  if (!YTDLP_AUDIO_LANG) return kind === 'proxy' ? YTDLP_FORMAT : YTDLP_FORMAT_OTHER;
+  const l = YTDLP_AUDIO_LANG;
+  return kind === 'proxy'
+    ? `bv*[height<=1080][ext=mp4]+ba[ext=m4a][language^=${l}]/bv*[height<=1080]+ba[language^=${l}]/${YTDLP_FORMAT}`
+    : `bv*[height<=1080]+ba[language^=${l}]/${YTDLP_FORMAT_OTHER}`;
+}
 const CACHE_MAX_BYTES = (Number(process.env.CACHE_MAX_GB) || 20) * 1024 ** 3;
 
 if (SECRET.length < 32) {
@@ -550,7 +559,7 @@ function prepareDownload(src, by) {
 
   const args = [
     '--no-playlist', '--newline', '--no-mtime',
-    '-f', src.kind === 'proxy' ? YTDLP_FORMAT : YTDLP_FORMAT_OTHER,
+    '-f', formatFor(src.kind),
     '--merge-output-format', 'mp4',
     '-o', path.join(YT_DIR, `${key}.%(ext)s`),
     '--print', 'before_dl:KZTITLE %(title)s',

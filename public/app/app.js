@@ -211,7 +211,256 @@
   const video = $('video');
   const ytBox = $('ytBox');
 
-  const yt = { apiPromise: null, player: null, ready: false, videoId: null, sentMeta: false };
+  const yt = {
+    apiPromise: null, player: null, ready: false, videoId: null, sentMeta: false, ccTrackSet: false,
+    // «Меню YouTube»: показать родные кнопки YouTube (там звуковая дорожка и качество)
+    controls: store.get('kz_ytcontrols', 'off') === 'on',
+    cmdAt: 0,        // когда сайт сам последний раз управлял плеером
+    readyAt: 0,      // когда ролик загрузился
+    roomAt: 0,       // когда пришло новое состояние комнаты
+  };
+
+  // Плей/пауза/перемотка через родные кнопки YouTube — отправляем второму
+  function ytUserAction(stateCode) {
+    if (!yt.controls || !S.room || !S.room.source || S.room.source.kind !== 'youtube') return;
+    if (Date.now() - yt.cmdAt < 800) return; // это сделал сам сайт
+    if (stateCode === 1 && !S.room.playing) control('play', player.time());
+    else if (stateCode === 2 && S.room.playing) control('pause', player.time());
+  }
+
+  function updateClickCatch() {
+    // поверх плеера лежит прозрачный слой для кликов; с меню YouTube он мешал бы нажимать его кнопки
+    $('clickCatch').hidden = player.kind === 'yt' && yt.controls;
+  }
+
+  function setYtControls(on) {
+    yt.controls = on;
+    store.set('kz_ytcontrols', on ? 'on' : 'off');
+    updateClickCatch();
+    if (!yt.player) return;
+    // настройки плеера YouTube меняются только пересозданием
+    try { yt.player.destroy(); } catch { /* ignore */ }
+    ytBox.replaceChildren(h('div', { id: 'ytHost' }));
+    yt.player = null;
+    yt.ready = false;
+    S.mediaReady = false;
+    if (player.kind === 'yt' && yt.videoId) ytLoad(yt.videoId, S.loadedSid);
+  }
+
+  // ── Настройки видео: субтитры, звук, качество (у каждого свои, не синхронизируются) ──
+  // кнопки YouTube спрятаны, поэтому субтитрами YouTube управляем сами
+  const cc = {
+    on: store.get('kz_cc', 'off') === 'on',
+    lang: store.get('kz_cclang', ''),
+  };
+
+  function ytModules() {
+    try { return (yt.player.getOptions && yt.player.getOptions()) || []; } catch { return []; }
+  }
+  function ytTracks() {
+    try { return yt.player.getOption('captions', 'tracklist') || []; } catch { return []; }
+  }
+
+  function applyCaptions() {
+    if (!yt.ready) return;
+    try {
+      const loaded = ytModules().includes('captions');
+      if (!cc.on) {
+        if (loaded) yt.player.unloadModule('captions');
+        return;
+      }
+      if (!loaded) { yt.player.loadModule('captions'); return; } // дорисуем, когда модуль загрузится
+      if (cc.lang && !yt.ccTrackSet) {
+        const has = ytTracks().some((t) => t.languageCode === cc.lang);
+        if (has) { yt.player.setOption('captions', 'track', { languageCode: cc.lang }); yt.ccTrackSet = true; }
+      }
+    } catch { /* старая версия API — ничего страшного */ }
+  }
+
+  function setCaptions(on, lang) {
+    cc.on = on;
+    if (lang !== undefined) cc.lang = lang;
+    store.set('kz_cc', on ? 'on' : 'off');
+    store.set('kz_cclang', cc.lang);
+    yt.ccTrackSet = false;
+    if (yt.ready) {
+      try {
+        if (on) {
+          if (!ytModules().includes('captions')) yt.player.loadModule('captions');
+          if (cc.lang) { yt.player.setOption('captions', 'track', { languageCode: cc.lang }); yt.ccTrackSet = true; }
+        } else {
+          yt.player.unloadModule('captions');
+        }
+      } catch { /* ignore */ }
+    }
+  }
+
+  // Названия дорожек: «Русский (AniLibria)», «Japanese» и т.п.
+  const langNames = (() => {
+    try { return new Intl.DisplayNames(['ru'], { type: 'language' }); } catch { return null; }
+  })();
+  function trackLabel(t, i, fallback) {
+    const name = (t.name || t.label || '').trim();
+    let lang = '';
+    const code = (t.lang || t.language || '').trim();
+    if (code && langNames) { try { lang = langNames.of(code); } catch { lang = code; } }
+    if (lang) lang = lang.charAt(0).toUpperCase() + lang.slice(1);
+    if (name && lang && !name.toLowerCase().includes(lang.toLowerCase())) return `${lang} · ${name}`;
+    return name || lang || `${fallback} ${i + 1}`;
+  }
+
+  // Собирает разделы меню для того, что сейчас играет
+  function settingsSections() {
+    const sections = [];
+    const src = S.room && S.room.source;
+    if (!src) return sections;
+
+    if (player.kind === 'yt') {
+      const tracks = cc.on ? ytTracks() : [];
+      sections.push({
+        title: 'Субтитры',
+        items: [
+          { label: 'Выключить', checked: !cc.on, pick: () => setCaptions(false) },
+          { label: 'Включить', checked: cc.on && !cc.lang, pick: () => setCaptions(true, '') },
+          ...tracks.map((t) => ({
+            label: t.displayName || t.languageName || t.languageCode,
+            checked: cc.on && cc.lang === t.languageCode,
+            pick: () => setCaptions(true, t.languageCode),
+          })),
+        ],
+        note: cc.on && !tracks.length ? 'Языки появятся, когда ролик начнёт играть. Не появились — у ролика нет субтитров.' : '',
+      });
+      sections.push({
+        title: 'Звуковая дорожка и качество',
+        items: [
+          { label: 'Показать меню YouTube', checked: yt.controls, pick: () => setYtControls(!yt.controls) },
+        ],
+        note: yt.controls
+          ? 'В правом нижнем углу плеера — шестерёнка YouTube: «Звуковая дорожка» и «Качество». Плей и перемотка там тоже общие. Скорость не меняй — собьётся синхронизация. Нажми пункт ещё раз, чтобы скрыть.'
+          : 'Покажет родные кнопки YouTube: там можно выбрать звуковую дорожку (если у ролика их несколько) и качество. У каждого своё.',
+      });
+      return sections;
+    }
+
+    if (hls) {
+      const levels = hls.levels || [];
+      if (levels.length > 1) {
+        const order = levels.map((l, i) => ({ l, i })).sort((a, b) => (b.l.height || b.l.bitrate) - (a.l.height || a.l.bitrate));
+        sections.push({
+          title: 'Качество',
+          items: [
+            { label: 'Авто', checked: hls.autoLevelEnabled, pick: () => { hls.currentLevel = -1; } },
+            ...order.map(({ l, i }) => ({
+              label: l.height ? `${l.height}p` : `${Math.round((l.bitrate || 0) / 1000)} кбит/с`,
+              checked: !hls.autoLevelEnabled && hls.currentLevel === i,
+              pick: () => { hls.currentLevel = i; },
+            })),
+          ],
+        });
+      }
+      const audio = hls.audioTracks || [];
+      if (audio.length > 1) {
+        sections.push({
+          title: 'Звуковая дорожка',
+          items: audio.map((t, i) => ({
+            label: trackLabel(t, i, 'Дорожка'),
+            checked: hls.audioTrack === i,
+            pick: () => { hls.audioTrack = i; store.set('kz_audiolang', t.lang || t.name || ''); },
+          })),
+        });
+      }
+      const subs = hls.subtitleTracks || [];
+      if (subs.length) {
+        sections.push({
+          title: 'Субтитры',
+          items: [
+            { label: 'Выключить', checked: hls.subtitleTrack === -1, pick: () => { hls.subtitleTrack = -1; } },
+            ...subs.map((t, i) => ({
+              label: trackLabel(t, i, 'Субтитры'),
+              checked: hls.subtitleTrack === i,
+              pick: () => { hls.subtitleDisplay = true; hls.subtitleTrack = i; },
+            })),
+          ],
+        });
+      }
+    } else if (player.kind === 'html') {
+      // обычный видеофайл: дорожки видит только часть браузеров (например, Safari)
+      const at = video.audioTracks;
+      if (at && at.length > 1) {
+        const list = Array.from(at);
+        sections.push({
+          title: 'Звуковая дорожка',
+          items: list.map((t, i) => ({
+            label: trackLabel({ name: t.label, lang: t.language }, i, 'Дорожка'),
+            checked: t.enabled,
+            pick: () => { list.forEach((x, j) => { x.enabled = j === i; }); },
+          })),
+        });
+      }
+      const tt = Array.from(video.textTracks || []).filter((t) => t.kind === 'subtitles' || t.kind === 'captions');
+      if (tt.length) {
+        sections.push({
+          title: 'Субтитры',
+          items: [
+            { label: 'Выключить', checked: tt.every((t) => t.mode !== 'showing'), pick: () => tt.forEach((t) => { t.mode = 'disabled'; }) },
+            ...tt.map((t, i) => ({
+              label: trackLabel({ name: t.label, lang: t.language }, i, 'Субтитры'),
+              checked: t.mode === 'showing',
+              pick: () => tt.forEach((x, j) => { x.mode = j === i ? 'showing' : 'disabled'; }),
+            })),
+          ],
+        });
+      }
+    }
+    return sections;
+  }
+
+  function renderSettingsMenu() {
+    const btn = $('setBtn');
+    btn.classList.toggle('on', player.kind === 'yt' && cc.on);
+    const menu = $('setMenu');
+    if (menu.hidden) return;
+    const sections = settingsSections();
+    const nodes = [];
+    for (const sec of sections) {
+      nodes.push(h('div', { class: 'cc-title' }, sec.title));
+      for (const it of sec.items) {
+        nodes.push(h('button', {
+          type: 'button', class: 'cc-item', role: 'menuitemradio', 'aria-checked': String(!!it.checked),
+          onclick: () => { it.pick(); setTimeout(renderSettingsMenu, 150); },
+        }, it.label));
+      }
+      if (sec.note) nodes.push(h('div', { class: 'cc-note' }, sec.note));
+    }
+    if (!sections.length) {
+      nodes.push(h('div', { class: 'cc-title' }, 'Настройки видео'));
+      nodes.push(h('div', { class: 'cc-note' }, player.kind === 'html' && !hls
+        ? 'У этого видео нет дорожек или субтитров, которые видит браузер. Если в файле есть несколько озвучек, их может показать только Safari — или выбери озвучку при скачивании.'
+        : 'У этого видео нет дополнительных настроек.'));
+    }
+    menu.replaceChildren(...nodes);
+  }
+  const renderCcMenu = renderSettingsMenu;
+
+  function openSettings() {
+    $('setMenu').hidden = false;
+    $('setBtn').setAttribute('aria-expanded', 'true');
+    renderSettingsMenu();
+  }
+  function closeCcMenu() {
+    $('setMenu').hidden = true;
+    $('setBtn').setAttribute('aria-expanded', 'false');
+  }
+  $('setBtn').addEventListener('click', (e) => {
+    e.stopPropagation();
+    if ($('setMenu').hidden) openSettings(); else closeCcMenu();
+  });
+  document.addEventListener('click', (e) => {
+    if (!$('setMenu').hidden && !$('setWrap').contains(e.target)) closeCcMenu();
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && !$('setMenu').hidden) { closeCcMenu(); $('setBtn').focus(); }
+  });
 
   function loadYtApi() {
     if (window.YT && window.YT.Player) return Promise.resolve();
@@ -239,8 +488,11 @@
     if (S.loadedSid !== sid) return;
     yt.videoId = videoId;
     yt.sentMeta = false;
+    yt.ccTrackSet = false;
     if (yt.player && yt.ready) {
+      yt.cmdAt = Date.now();
       yt.player.cueVideoById({ videoId, startSeconds: Math.max(0, expectedPosition()) });
+      yt.readyAt = Date.now();
       S.mediaReady = true;
       renderOverlay();
       syncTick();
@@ -252,8 +504,9 @@
       width: '100%',
       height: '100%',
       playerVars: {
-        controls: 0, disablekb: 1, rel: 0, modestbranding: 1, playsinline: 1,
+        controls: yt.controls ? 1 : 0, disablekb: yt.controls ? 0 : 1, rel: 0, modestbranding: 1, playsinline: 1,
         iv_load_policy: 3, fs: 0, origin: location.origin,
+        cc_load_policy: cc.on ? 1 : 0, hl: 'ru',
         start: Math.floor(Math.max(0, expectedPosition())),
       },
       events: {
@@ -263,7 +516,9 @@
             yt.player.cueVideoById(yt.videoId);
           }
           yt.player.setVolume(Number($('volume').value) * 100);
+          applyCaptions();
           if (S.room && S.room.source && S.room.source.kind === 'youtube') {
+            yt.readyAt = Date.now();
             S.mediaReady = true;
             renderOverlay();
             syncTick();
@@ -271,12 +526,19 @@
         },
         onStateChange: (e) => {
           if (!S.room || !S.room.source || S.room.source.kind !== 'youtube') return;
+          if (e.data === 1) applyCaptions(); // YouTube подгружает субтитры при старте — сразу применяем свой выбор
+          if (e.data === 1 || e.data === 2) ytUserAction(e.data);
           if (e.data === 1 && !yt.sentMeta) {
             yt.sentMeta = true;
             const d = yt.player.getVideoData ? yt.player.getVideoData() : null;
             if (d && d.title && !S.room.source.title) send({ type: 'meta', sid: S.room.source.sid, title: d.title });
           }
           if (e.data === 0) send({ type: 'ended', sid: S.room.source.sid, position: yt.player.getCurrentTime() });
+        },
+        onApiChange: () => {
+          // модуль субтитров загрузился или выгрузился
+          applyCaptions();
+          renderCcMenu();
         },
         onError: (e) => {
           S.ytError = [101, 150].includes(e.data) ? 'embed' : 'video';
@@ -305,15 +567,15 @@
       return !video.paused && !video.ended;
     },
     play() {
-      if (this.kind === 'yt') { if (yt.ready) yt.player.playVideo(); return Promise.resolve(); }
+      if (this.kind === 'yt') { if (yt.ready) { yt.cmdAt = Date.now(); yt.player.playVideo(); } return Promise.resolve(); }
       return video.play();
     },
     pause() {
-      if (this.kind === 'yt') { if (yt.ready) yt.player.pauseVideo(); return; }
+      if (this.kind === 'yt') { if (yt.ready) { yt.cmdAt = Date.now(); yt.player.pauseVideo(); } return; }
       video.pause();
     },
     seek(t) {
-      if (this.kind === 'yt') { if (yt.ready) yt.player.seekTo(t, true); return; }
+      if (this.kind === 'yt') { if (yt.ready) { yt.cmdAt = Date.now(); yt.player.seekTo(t, true); } return; }
       try { video.currentTime = t; } catch { /* ещё не загрузилось */ }
     },
     setVolume(v) {
@@ -323,6 +585,7 @@
   };
 
   video.addEventListener('loadedmetadata', () => {
+    renderSettingsMenu();
     S.mediaReady = true;
     renderOverlay();
     syncTick();
@@ -373,6 +636,19 @@
       S.ytError = 'direct';
       renderOverlay();
     });
+    const E = window.Hls.Events;
+    // если в прошлый раз выбирали озвучку — пробуем включить такую же
+    hls.on(E.AUDIO_TRACKS_UPDATED, () => {
+      const want = store.get('kz_audiolang', '');
+      if (want) {
+        const i = hls.audioTracks.findIndex((t) => (t.lang || t.name || '') === want);
+        if (i >= 0 && i !== hls.audioTrack) hls.audioTrack = i;
+      }
+      renderSettingsMenu();
+    });
+    for (const ev of [E.MANIFEST_PARSED, E.LEVEL_SWITCHED, E.AUDIO_TRACK_SWITCHED, E.SUBTITLE_TRACKS_UPDATED, E.SUBTITLE_TRACK_SWITCH]) {
+      hls.on(ev, () => renderSettingsMenu());
+    }
     hls.loadSource(url);
     hls.attachMedia(video);
   }
@@ -402,11 +678,17 @@
       player.kind = null;
       ytBox.hidden = true;
       video.hidden = true;
+      $('setWrap').hidden = true;
+      closeCcMenu();
       return;
     }
 
+    $('setWrap').hidden = false;
+    closeCcMenu();
+
     if (src.kind === 'youtube') {
       player.kind = 'yt';
+      updateClickCatch();
       video.hidden = true;
       ytBox.hidden = false;
       ytLoad(src.ref, sid);
@@ -414,6 +696,7 @@
     }
 
     player.kind = 'html';
+    updateClickCatch();
     ytBox.hidden = true;
     video.hidden = false;
     if (src.kind === 'upload') video.src = `/media/upload/${encodeURIComponent(src.ref)}`;
@@ -450,6 +733,18 @@
 
     const diff = player.time() - target;
     const tolerance = player.kind === 'yt' ? 1.2 : 0.6;
+
+    // Перемотали полосой в меню YouTube — это действие человека, отправляем его второму
+    if (player.kind === 'yt' && yt.controls && Math.abs(diff) > 3) {
+      const now = Date.now();
+      let st = -1;
+      try { st = yt.player.getPlayerState(); } catch { /* ignore */ }
+      if ((st === 1 || st === 2) && now - yt.cmdAt > 2500 && now - yt.readyAt > 4000 && now - yt.roomAt > 2500) {
+        control('seek', player.time());
+        return;
+      }
+    }
+
     if (Math.abs(diff) > tolerance && !S.seeking) player.seek(target);
   }
   setInterval(syncTick, 500);
@@ -857,6 +1152,9 @@
   // ───────────────────────── Отрисовка ─────────────────────────
 
   function setRoom(state) {
+    const prev = S.room;
+    // второй нажал плей/паузу/перемотку — наш плеер сейчас догонит, это не наше действие
+    if (!prev || !state || prev.updatedAt !== state.updatedAt || prev.playing !== state.playing) yt.roomAt = Date.now();
     S.room = state;
     applySource();
     renderControls();

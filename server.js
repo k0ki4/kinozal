@@ -359,6 +359,8 @@ let stats = { together: 0, videos: 0, reactions: emptyReactions(), firstAt: null
 const DIARY_MAX = 2000;
 const WISH_MAX = 300;
 const DIARY_SEND = 300; // сколько последних записей отдавать при входе
+const CHAT_PAGE = 100;  // сколько сообщений чата отдавать за раз
+let chatHasMore = false; // есть ли в истории сообщения старше тех, что в памяти
 
 const store = createStore({ databaseUrl: process.env.DATABASE_URL || '', dataDir: DATA_DIR });
 
@@ -367,7 +369,6 @@ function roomForSave() {
     source: room.source,
     position: currentPosition(),
     queue: room.queue,
-    messages: room.messages,
     reactions: room.reactions,
     settings: room.settings,
     session: room.session,
@@ -386,12 +387,22 @@ async function loadAll() {
       source: saved.source || null,
       position: Number(saved.position) || 0,
       queue: Array.isArray(saved.queue) ? saved.queue : [],
-      messages: Array.isArray(saved.messages) ? saved.messages.slice(-200) : [],
       reactions: { ...emptyReactions(), ...(saved.reactions || {}) },
       settings: { waitForBuffer: true, ...(saved.settings || {}) },
       session: saved.session || null,
     });
   }
+  // Переписка хранится отдельно и целиком. Старые версии держали последние 200 сообщений
+  // прямо в состоянии комнаты — переносим их один раз.
+  const oldMessages = saved && Array.isArray(saved.messages) ? saved.messages : [];
+  if (oldMessages.length && (await store.messageCount()) === 0) {
+    await store.addMessages(oldMessages.filter((m) => m && m.id && m.by && m.text));
+    console.log(`Перенесено сообщений чата: ${oldMessages.length}`);
+  }
+  const recent = await store.recentMessages(CHAT_PAGE);
+  room.messages = recent.messages;
+  chatHasMore = recent.hasMore;
+
   const d = await store.get('diary');
   if (Array.isArray(d)) diary = d;
   const w = await store.get('wishlist');
@@ -422,7 +433,10 @@ function saveSoon(key = 'room', delay = 1500) {
 async function flushAll() {
   for (const { t } of saveTimers.values()) clearTimeout(t);
   saveTimers.clear();
-  await Promise.all(Object.entries(SAVERS).map(([k, fn]) => store.set(k, fn()).catch(() => {})));
+  await Promise.all([
+    ...Object.entries(SAVERS).map(([k, fn]) => store.set(k, fn()).catch(() => {})),
+    store.flushMessages().catch(() => {}),
+  ]);
 }
 
 function currentPosition() {
@@ -963,7 +977,7 @@ wss.on('connection', (ws) => {
   ws.on('pong', () => { ws.isAlive = true; });
 
   send(ws, {
-    type: 'init', me: ws.user.login, state: snapshot(), messages: room.messages,
+    type: 'init', me: ws.user.login, state: snapshot(), messages: room.messages, chatHasMore,
     diary: diary.slice(-DIARY_SEND).map(diaryOut), diaryTotal: diary.length,
     wishlist, stats: statsOut(),
   });
@@ -1203,9 +1217,24 @@ function handleMessage(ws, msg) {
       if (!text) return;
       const m = { id: newId(), by, text, at: Date.now() };
       room.messages.push(m);
-      if (room.messages.length > 200) room.messages.splice(0, room.messages.length - 200);
+      if (room.messages.length > CHAT_PAGE) {
+        room.messages.splice(0, room.messages.length - CHAT_PAGE);
+        chatHasMore = true;
+      }
       broadcast({ type: 'chat', message: m });
-      saveSoon();
+      store.addMessage(m).catch((e) => console.error('Не сохранилось сообщение:', e.message));
+      break;
+    }
+
+    case 'chat_more': {
+      // прокрутили чат вверх — отдаём сообщения постарше
+      if (typeof msg.before !== 'string') return;
+      store.olderMessages(msg.before, CHAT_PAGE)
+        .then((r) => send(ws, { type: 'chat_older', messages: r.messages, hasMore: r.hasMore }))
+        .catch((e) => {
+          console.error('Не загрузилась история чата:', e.message);
+          send(ws, { type: 'chat_older', messages: [], hasMore: true, error: true });
+        });
       break;
     }
 
@@ -1230,8 +1259,9 @@ function handleMessage(ws, msg) {
 
     case 'clear_chat': {
       room.messages = [];
+      chatHasMore = false;
+      store.clearMessages().catch((e) => console.error('Не очистился чат:', e.message));
       broadcast({ type: 'chat_cleared', by });
-      saveSoon();
       break;
     }
   }

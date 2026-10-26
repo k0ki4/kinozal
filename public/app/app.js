@@ -100,6 +100,8 @@
     pendingLocal: null,
     seeking: false,
     unread: 0,
+    chat: [],           // загруженная переписка, от старых к новым
+    chatHasMore: false, // есть ли сообщения ещё раньше
     diary: [],          // записи дневника, от старых к новым
     diaryHasMore: false,
     wishlist: [],
@@ -182,6 +184,7 @@
         S.wishlist = msg.wishlist || [];
         S.stats = msg.stats || null;
         setRoom(msg.state);
+        S.chatHasMore = !!msg.chatHasMore;
         renderAllMessages(msg.messages);
         renderWishlist();
         renderDiary();
@@ -222,7 +225,11 @@
         }
         break;
       case 'chat_cleared':
+        S.chatHasMore = false;
         renderAllMessages([]);
+        break;
+      case 'chat_older':
+        prependOlderMessages(msg.messages || [], !!msg.hasMore, msg.error);
         break;
       case 'typing':
         showTyping(msg.by);
@@ -1223,27 +1230,92 @@
 
   const messagesEl = $('messages');
 
+  // Вся загруженная переписка, от старых к новым. Старые подгружаются при прокрутке вверх.
+  let chatLoading = false;
+  let chatLoadFailed = false;
+
   function messageEl(m) {
     return h('div', { class: `msg${isMe(m.by) ? ' mine' : ''}` },
       h('div', { class: 'bubble-text' }, m.text),
       h('div', { class: 'msg-meta' }, isMe(m.by) ? fmtClock(m.at) : `${userName(m.by)} · ${fmtClock(m.at)}`));
   }
 
+  const dayKey = (ms) => new Date(ms).toDateString();
+  const daySep = (ms) => h('div', { class: 'msg-day' }, h('span', {}, dayLabel(ms)));
+
+  function chatTopEl() {
+    if (S.chatHasMore) {
+      return h('div', { class: 'chat-top' },
+        chatLoading
+          ? h('span', {}, 'Загружаем…')
+          : h('button', { type: 'button', class: 'link-btn', onclick: loadOlderMessages }, chatLoadFailed ? 'Не загрузилось — попробовать ещё раз' : 'Показать раньше'));
+    }
+    if (S.chat.length) return h('div', { class: 'chat-top' }, h('span', {}, 'Это начало вашей переписки'));
+    return null;
+  }
+
+  function renderChatList() {
+    const nodes = [];
+    const top = chatTopEl();
+    if (top) nodes.push(top);
+    if (!S.chat.length) {
+      nodes.push(h('div', { class: 'msg sys' }, h('div', { class: 'bubble-text' }, 'Тут будет ваш чатик')));
+    }
+    let lastDay = null;
+    for (const m of S.chat) {
+      const d = dayKey(m.at);
+      if (d !== lastDay) { nodes.push(daySep(m.at)); lastDay = d; }
+      nodes.push(messageEl(m));
+    }
+    messagesEl.replaceChildren(...nodes);
+  }
+
   function renderAllMessages(list) {
-    messagesEl.replaceChildren(...(list.length ? list.map(messageEl) : [
-      h('div', { class: 'msg sys' }, h('div', { class: 'bubble-text' }, 'Тут будет ваш чатик')),
-    ]));
+    S.chat = list.slice();
+    chatLoading = false;
+    chatLoadFailed = false;
+    renderChatList();
     messagesEl.scrollTop = messagesEl.scrollHeight;
   }
 
   function addMessage(m) {
     const nearBottom = messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight < 120;
-    const placeholder = messagesEl.querySelector('.msg.sys');
-    if (placeholder) placeholder.remove();
-    messagesEl.append(messageEl(m));
-    while (messagesEl.children.length > 200) messagesEl.firstChild.remove();
+    const prev = S.chat[S.chat.length - 1];
+    const first = !S.chat.length;
+    S.chat.push(m);
+    if (first) {
+      renderChatList();
+    } else {
+      if (!prev || dayKey(prev.at) !== dayKey(m.at)) messagesEl.append(daySep(m.at));
+      messagesEl.append(messageEl(m));
+    }
     if (nearBottom || isMe(m.by)) messagesEl.scrollTop = messagesEl.scrollHeight;
   }
+
+  function loadOlderMessages() {
+    if (chatLoading || !S.chatHasMore || !S.chat.length) return;
+    chatLoading = true;
+    chatLoadFailed = false;
+    const top = messagesEl.querySelector('.chat-top');
+    if (top) top.replaceChildren(h('span', {}, 'Загружаем…'));
+    send({ type: 'chat_more', before: S.chat[0].id });
+  }
+
+  function prependOlderMessages(list, hasMore, failed) {
+    chatLoading = false;
+    chatLoadFailed = !!failed;
+    S.chatHasMore = hasMore;
+    // оставляем на экране то же сообщение, что было, — новые появляются выше
+    const fromBottom = messagesEl.scrollHeight - messagesEl.scrollTop;
+    const known = new Set(S.chat.map((m) => m.id));
+    S.chat = list.filter((m) => !known.has(m.id)).concat(S.chat);
+    renderChatList();
+    messagesEl.scrollTop = messagesEl.scrollHeight - fromBottom;
+  }
+
+  messagesEl.addEventListener('scroll', () => {
+    if (messagesEl.scrollTop < 80 && !chatLoadFailed) loadOlderMessages();
+  }, { passive: true });
 
   let lastTypingSent = 0;
   $('chatInput').addEventListener('input', () => {
@@ -1721,7 +1793,7 @@
       /* попробуем через сокет */
     }
     const p = partner();
-    if (p) $('chatInput').placeholder = `Написать ${p.name}…`;
+    if (p) $('chatInput').placeholder = 'Написать что-нибудь…';
     renderModes();
     renderPresence();
     renderOverlay();

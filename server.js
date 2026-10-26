@@ -10,6 +10,7 @@ const { spawn } = require('child_process');
 const express = require('express');
 const multer = require('multer');
 const { WebSocketServer, WebSocket } = require('ws');
+const { createStore } = require('./storage');
 
 // ───────────────────────── Настройки ─────────────────────────
 
@@ -345,34 +346,83 @@ const room = {
   reactions: emptyReactions(),
   lastAction: null,    // { by, action, position, at }
   preparing: null,     // { key, source, label, title, percent, stage, error, by }
+  settings: { waitForBuffer: true },
+  waiting: null,       // { since } — пауза «подожди меня»
+  session: null,       // текущий просмотр для дневника
 };
 
-try {
-  const saved = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
-  Object.assign(room, {
-    source: saved.source || null,
-    position: Number(saved.position) || 0,
-    queue: Array.isArray(saved.queue) ? saved.queue : [],
-    messages: Array.isArray(saved.messages) ? saved.messages.slice(-200) : [],
-    reactions: { ...emptyReactions(), ...(saved.reactions || {}) },
-  });
-} catch { /* первый запуск */ }
+// Дневник, хотелки и общая статистика
+let diary = [];      // [{ id, kind, ref, title, startedAt, endedAt, together, reactions, notes: { login: текст }, by }]
+let wishlist = [];   // [{ id, source, note, by, at }]
+let stats = { together: 0, videos: 0, reactions: emptyReactions(), firstAt: null };
 
-let saveTimer = null;
-function saveSoon() {
-  clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => {
-    const data = {
-      source: room.source,
-      position: currentPosition(),
-      queue: room.queue,
-      messages: room.messages,
-      reactions: room.reactions,
-    };
-    fsp.writeFile(STATE_FILE + '.tmp', JSON.stringify(data))
-      .then(() => fsp.rename(STATE_FILE + '.tmp', STATE_FILE))
-      .catch((e) => console.error('Не сохранилось состояние:', e.message));
-  }, 1500);
+const DIARY_MAX = 2000;
+const WISH_MAX = 300;
+const DIARY_SEND = 300; // сколько последних записей отдавать при входе
+
+const store = createStore({ databaseUrl: process.env.DATABASE_URL || '', dataDir: DATA_DIR });
+
+function roomForSave() {
+  return {
+    source: room.source,
+    position: currentPosition(),
+    queue: room.queue,
+    messages: room.messages,
+    reactions: room.reactions,
+    settings: room.settings,
+    session: room.session,
+  };
+}
+
+async function loadAll() {
+  await store.init();
+  let saved = await store.get('room');
+  if (!saved && store.kind === 'файлы') {
+    // старый файл состояния из прошлых версий
+    try { saved = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); } catch { /* нет */ }
+  }
+  if (saved) {
+    Object.assign(room, {
+      source: saved.source || null,
+      position: Number(saved.position) || 0,
+      queue: Array.isArray(saved.queue) ? saved.queue : [],
+      messages: Array.isArray(saved.messages) ? saved.messages.slice(-200) : [],
+      reactions: { ...emptyReactions(), ...(saved.reactions || {}) },
+      settings: { waitForBuffer: true, ...(saved.settings || {}) },
+      session: saved.session || null,
+    });
+  }
+  const d = await store.get('diary');
+  if (Array.isArray(d)) diary = d;
+  const w = await store.get('wishlist');
+  if (Array.isArray(w)) wishlist = w;
+  const st = await store.get('stats');
+  if (st && typeof st === 'object') stats = { ...stats, ...st, reactions: { ...emptyReactions(), ...(st.reactions || {}) } };
+}
+
+// Сохранение с задержкой: частые изменения копятся и пишутся одним разом
+const saveTimers = new Map(); // key -> { at, t }
+const SAVERS = { room: roomForSave, diary: () => diary, wishlist: () => wishlist, stats: () => stats };
+
+function saveSoon(key = 'room', delay = 1500) {
+  const at = Date.now() + delay;
+  const cur = saveTimers.get(key);
+  if (cur && cur.at <= at) return;
+  if (cur) clearTimeout(cur.t);
+  const t = setTimeout(() => {
+    saveTimers.delete(key);
+    store.set(key, SAVERS[key]()).catch((e) => {
+      console.error(`Не сохранилось (${key}):`, e.message);
+      saveSoon(key, 15000); // попробуем позже
+    });
+  }, delay);
+  saveTimers.set(key, { at, t });
+}
+
+async function flushAll() {
+  for (const { t } of saveTimers.values()) clearTimeout(t);
+  saveTimers.clear();
+  await Promise.all(Object.entries(SAVERS).map(([k, fn]) => store.set(k, fn()).catch(() => {})));
 }
 
 function currentPosition() {
@@ -389,6 +439,8 @@ function snapshot() {
     reactions: room.reactions,
     lastAction: room.lastAction,
     preparing: room.preparing,
+    settings: room.settings,
+    waiting: room.waiting ? { since: room.waiting.since, users: [...bufferingUsers] } : null,
     serverNow: Date.now(),
   };
 }
@@ -404,10 +456,16 @@ function broadcastState() {
   broadcast({ type: 'state', state: snapshot() });
   saveSoon();
 }
-function broadcastPresence() {
+function onlineLogins() {
   const online = new Set();
   for (const ws of wss.clients) if (ws.user) online.add(ws.user.login);
+  return online;
+}
+function broadcastPresence() {
+  const online = onlineLogins();
   broadcast({ type: 'presence', online: [...online] });
+  // все ушли — закрываем запись в дневнике (если вернутся к тому же видео, она продолжится)
+  if (online.size === 0) finalizeSession();
 }
 
 const newId = () => crypto.randomBytes(8).toString('hex');
@@ -489,12 +547,173 @@ function validateSource(src) {
 }
 
 function setSource(src, by) {
+  finalizeSession();
+  clearWaiting();
   room.source = { ...src, sid: newId(), by };
   room.playing = false;
   room.position = 0;
   room.updatedAt = Date.now();
   room.reactions = emptyReactions();
   room.lastAction = { by, action: 'load', position: 0, at: Date.now() };
+}
+
+// ───────────────────────── Дневник просмотров и статистика ─────────────────────────
+
+const DIARY_MIN_SECONDS = 60;          // меньше минуты вместе — в дневник не пишем
+const DIARY_MERGE_MS = 6 * 3600 * 1000; // вернулись к тому же видео в течение 6 часов — та же запись
+
+// Каждые 5 секунд: если видео играет и вы оба на сайте — копим совместное время
+let lastTick = Date.now();
+setInterval(() => {
+  const now = Date.now();
+  const dt = Math.min(now - lastTick, 15000) / 1000;
+  lastTick = now;
+  // долго ждали того, у кого грузится, — продолжаем без него
+  if (room.waiting && now - room.waiting.since > WAIT_MAX_MS) {
+    bufferingUsers.clear();
+    if (maybeResume(null)) broadcastState();
+  }
+  if (!room.source || !room.playing) return;
+  ensureSession();
+  if (onlineLogins().size >= 2) {
+    room.session.together += dt;
+    stats.together += dt;
+    if (!stats.firstAt) stats.firstAt = now;
+    saveSoon('room', 30000);
+    saveSoon('stats', 30000);
+  }
+}, 5000).unref();
+
+const WAIT_MAX_MS = 30000;
+
+// Запись о текущем просмотре (создаётся при первом плее или реакции)
+function ensureSession() {
+  if (!room.source) return null;
+  if (room.session && room.session.sid === room.source.sid) return room.session;
+  finalizeSession();
+  room.session = {
+    sid: room.source.sid, kind: room.source.kind, ref: room.source.ref,
+    title: room.source.title || null, file: room.source.file || null, name: room.source.name || null,
+    size: room.source.size || null, by: room.source.by,
+    startedAt: Date.now(), together: 0, reactions: emptyReactions(),
+  };
+  return room.session;
+}
+
+function diaryRewatchable(e) {
+  if (e.kind === 'local') return false;
+  if (e.kind === 'upload') return UPLOADS_ENABLED && MEDIA_RE.test(e.ref) && fs.existsSync(path.join(UPLOAD_DIR, e.ref));
+  if (e.kind === 'proxy' || e.kind === 'site') return YTDLP_ENABLED;
+  return true;
+}
+const diaryOut = (e) => ({ ...e, together: Math.round(e.together), rewatch: diaryRewatchable(e) });
+
+function finalizeSession() {
+  const s = room.session;
+  room.session = null;
+  if (!s || s.together < DIARY_MIN_SECONDS) return;
+  const now = Date.now();
+  if (room.source && room.source.sid === s.sid && room.source.title) s.title = room.source.title;
+
+  const last = diary[diary.length - 1];
+  let entry;
+  if (last && last.kind === s.kind && last.ref === s.ref && s.startedAt - last.endedAt < DIARY_MERGE_MS) {
+    entry = last;
+    entry.together += s.together;
+    entry.endedAt = now;
+    for (const k of REACTIONS) entry.reactions[k] = (entry.reactions[k] || 0) + (s.reactions[k] || 0);
+    if (!entry.title && s.title) entry.title = s.title;
+  } else {
+    entry = {
+      id: newId(), kind: s.kind, ref: s.ref, title: s.title, name: s.name, size: s.size,
+      startedAt: s.startedAt, endedAt: now, together: s.together,
+      reactions: { ...s.reactions }, notes: {}, by: s.by,
+    };
+    diary.push(entry);
+    if (diary.length > DIARY_MAX) diary.splice(0, diary.length - DIARY_MAX);
+    stats.videos += 1;
+  }
+  broadcast({ type: 'diary_upsert', entry: diaryOut(entry), stats: statsOut() });
+  saveSoon('diary');
+  saveSoon('stats');
+}
+
+function statsOut() {
+  // «самое смешное» и «самое любимое» — по записям дневника
+  let funniest = null;
+  let loved = null;
+  for (const e of diary) {
+    if ((e.reactions.laugh || 0) > 0 && (!funniest || e.reactions.laugh > funniest.reactions.laugh)) funniest = e;
+    if ((e.reactions.heart || 0) > 0 && (!loved || e.reactions.heart > loved.reactions.heart)) loved = e;
+  }
+  const pick = (e, k) => (e ? { id: e.id, title: e.title, kind: e.kind, ref: e.ref, count: e.reactions[k] } : null);
+  return {
+    together: Math.round(stats.together),
+    videos: stats.videos,
+    reactions: stats.reactions,
+    firstAt: stats.firstAt,
+    funniest: pick(funniest, 'laugh'),
+    loved: pick(loved, 'heart'),
+  };
+}
+
+// ───────────────────────── Хотелки и названия роликов ─────────────────────────
+
+// Название ролика YouTube — через открытый oEmbed (сервер стоит за границей, ему YouTube доступен)
+async function fetchYoutubeTitle(id) {
+  if (!YT_ID_RE.test(id)) return null;
+  try {
+    const r = await fetch(`https://www.youtube.com/oembed?format=json&url=${encodeURIComponent(`https://www.youtube.com/watch?v=${id}`)}`, {
+      signal: AbortSignal.timeout(6000),
+    });
+    if (!r.ok) return null;
+    const j = await r.json();
+    return cleanText(j.title, 200) || null;
+  } catch {
+    return null;
+  }
+}
+
+// Подставить название, если его нет, и сообщить об этом всем
+async function fillTitle(src, onDone) {
+  if (src.title || (src.kind !== 'youtube' && src.kind !== 'proxy')) return;
+  const t = await fetchYoutubeTitle(src.ref);
+  if (!t) return;
+  src.title = t;
+  onDone();
+}
+
+function broadcastWishlist() {
+  broadcast({ type: 'wishlist', items: wishlist });
+  saveSoon('wishlist');
+}
+
+// ───────────────────────── «Подожди меня» ─────────────────────────
+// Если у кого-то видео грузится, ставим паузу обоим и продолжаем, когда догрузится.
+
+const bufferingUsers = new Set();
+
+function clearWaiting() {
+  bufferingUsers.clear();
+  room.waiting = null;
+}
+
+function startWaiting(by) {
+  if (!room.playing) return;
+  room.position = currentPosition();
+  room.playing = false;
+  room.updatedAt = Date.now();
+  room.waiting = { since: Date.now() };
+  room.lastAction = { by, action: 'wait', position: room.position, at: Date.now() };
+}
+
+function maybeResume(by) {
+  if (!room.waiting || bufferingUsers.size > 0) return false;
+  room.waiting = null;
+  room.playing = true;
+  room.updatedAt = Date.now();
+  room.lastAction = { by, action: 'resume', position: room.position, at: Date.now() };
+  return true;
 }
 
 // Включить источник: для режима «через сервер» сначала скачать
@@ -681,6 +900,7 @@ async function cleanupMedia() {
   const addKeep = (s) => { if (s && s.kind === 'upload') keep.add(s.ref); if (s && s.file) keep.add(s.file); };
   addKeep(room.source);
   for (const q of room.queue) addKeep(q.source);
+  for (const w of wishlist) addKeep(w.source);
 
   const files = [];
   for (const dir of [YT_DIR, UPLOAD_DIR]) {
@@ -742,7 +962,11 @@ wss.on('connection', (ws) => {
   ws.reactTimes = [];
   ws.on('pong', () => { ws.isAlive = true; });
 
-  send(ws, { type: 'init', me: ws.user.login, state: snapshot(), messages: room.messages });
+  send(ws, {
+    type: 'init', me: ws.user.login, state: snapshot(), messages: room.messages,
+    diary: diary.slice(-DIARY_SEND).map(diaryOut), diaryTotal: diary.length,
+    wishlist, stats: statsOut(),
+  });
   broadcastPresence();
 
   ws.on('message', (data) => {
@@ -756,7 +980,13 @@ wss.on('connection', (ws) => {
     }
   });
 
-  ws.on('close', () => broadcastPresence());
+  ws.on('close', () => {
+    // ушёл тот, кого ждали, — продолжаем без него (если других его вкладок нет)
+    const login = ws.user.login;
+    const stillHere = [...wss.clients].some((c) => c !== ws && c.user && c.user.login === login);
+    if (!stillHere && bufferingUsers.delete(login) && maybeResume(login)) broadcastState();
+    broadcastPresence();
+  });
 });
 
 // Проверка «живых» соединений
@@ -780,9 +1010,10 @@ function handleMessage(ws, msg) {
       if (msg.sid && msg.sid !== room.source.sid) return;
       const pos = Number(msg.position);
       if (!Number.isFinite(pos) || pos < 0 || pos > 60 * 60 * 24) return;
-      if (msg.action === 'play') room.playing = true;
-      else if (msg.action === 'pause') room.playing = false;
+      if (msg.action === 'play') { room.playing = true; ensureSession(); } else if (msg.action === 'pause') room.playing = false;
       else if (msg.action !== 'seek') return;
+      // нажали плей или паузу сами — ждать больше не нужно
+      if (msg.action !== 'seek' && room.waiting) clearWaiting();
       room.position = pos;
       room.updatedAt = Date.now();
       room.lastAction = { by, action: msg.action, position: pos, at: Date.now() };
@@ -790,9 +1021,38 @@ function handleMessage(ws, msg) {
       break;
     }
 
+    case 'buffering': {
+      if (!room.source || msg.sid !== room.source.sid) return;
+      if (msg.on) {
+        if (!room.settings.waitForBuffer) return;
+        if (!room.playing && !room.waiting) return; // и так на паузе
+        bufferingUsers.add(by);
+        if (room.playing) startWaiting(by);
+        broadcastState();
+      } else if (bufferingUsers.delete(by)) {
+        maybeResume(by);
+        broadcastState();
+      }
+      break;
+    }
+
+    case 'settings': {
+      if (typeof msg.waitForBuffer === 'boolean') {
+        room.settings.waitForBuffer = msg.waitForBuffer;
+        if (!msg.waitForBuffer && room.waiting) { bufferingUsers.clear(); maybeResume(by); }
+        room.lastAction = { by, action: msg.waitForBuffer ? 'wait_on' : 'wait_off', position: currentPosition(), at: Date.now() };
+      }
+      broadcastState();
+      break;
+    }
+
     case 'load': {
       const src = validateSource(msg.source);
-      if (src) loadSource(src, by);
+      if (!src) return;
+      loadSource(src, by);
+      fillTitle(src, () => {
+        if (room.source && room.source.ref === src.ref && !room.source.title) { room.source.title = src.title; broadcastState(); }
+      });
       break;
     }
 
@@ -814,6 +1074,7 @@ function handleMessage(ws, msg) {
       if (!src || src.kind === 'local') return;
       room.queue.push({ id: newId(), source: src, by, at: Date.now() });
       broadcastState();
+      fillTitle(src, broadcastState);
       break;
     }
 
@@ -841,12 +1102,88 @@ function handleMessage(ws, msg) {
       break;
     }
 
+    // ── хотелки ──
+    case 'wish_add': {
+      if (wishlist.length >= WISH_MAX) return;
+      const src = validateSource(msg.source);
+      if (!src || src.kind === 'local') return;
+      const item = { id: newId(), source: src, note: cleanText(msg.note, 300), by, at: Date.now() };
+      wishlist.unshift(item);
+      broadcastWishlist();
+      fillTitle(src, broadcastWishlist);
+      break;
+    }
+
+    case 'wish_remove': {
+      wishlist = wishlist.filter((w) => w.id !== msg.id);
+      broadcastWishlist();
+      break;
+    }
+
+    case 'wish_queue':
+    case 'wish_play': {
+      const i = wishlist.findIndex((w) => w.id === msg.id);
+      if (i < 0) return;
+      const item = wishlist[i];
+      const src = validateSource(item.source);
+      if (!src) return;
+      if (src.title == null && item.source.title) src.title = item.source.title;
+      wishlist.splice(i, 1);
+      if (msg.type === 'wish_play') {
+        loadSource(src, by);
+      } else {
+        if (room.queue.length >= 100) return;
+        room.queue.push({ id: newId(), source: src, by, at: Date.now() });
+        broadcastState();
+      }
+      broadcastWishlist();
+      break;
+    }
+
+    // ── дневник ──
+    case 'diary_note': {
+      const e = diary.find((x) => x.id === msg.id);
+      if (!e) return;
+      const text = cleanText(msg.text, 500);
+      if (text) e.notes[by] = text; else delete e.notes[by];
+      broadcast({ type: 'diary_upsert', entry: diaryOut(e), stats: statsOut() });
+      saveSoon('diary');
+      break;
+    }
+
+    case 'diary_delete': {
+      const before = diary.length;
+      diary = diary.filter((x) => x.id !== msg.id);
+      if (diary.length === before) return;
+      broadcast({ type: 'diary_remove', id: msg.id, stats: statsOut() });
+      saveSoon('diary');
+      break;
+    }
+
+    case 'diary_rewatch': {
+      const e = diary.find((x) => x.id === msg.id);
+      if (!e || !diaryRewatchable(e)) return;
+      const src = validateSource({ kind: e.kind, ref: e.ref, title: e.title });
+      if (src) loadSource(src, by);
+      break;
+    }
+
+    case 'diary_more': {
+      // показать записи постарше
+      const i = diary.findIndex((x) => x.id === msg.before);
+      if (i <= 0) return;
+      send(ws, { type: 'diary_older', entries: diary.slice(Math.max(0, i - DIARY_SEND), i).map(diaryOut), hasMore: i - DIARY_SEND > 0 });
+      break;
+    }
+
     case 'ended': {
       // оба клиента пришлют «закончилось» — переключаем один раз
       if (!room.source || msg.sid !== room.source.sid) return;
       room.playing = false;
       room.position = Number(msg.position) || room.position;
       room.updatedAt = Date.now();
+      clearWaiting();
+      finalizeSession();
       if (!playNextFromQueue(by)) broadcastState();
       break;
     }
@@ -856,6 +1193,7 @@ function handleMessage(ws, msg) {
       const t = cleanText(msg.title, 200);
       if (!t) return;
       room.source.title = t;
+      if (room.session && room.session.sid === room.source.sid) room.session.title = t;
       broadcastState();
       break;
     }
@@ -882,8 +1220,11 @@ function handleMessage(ws, msg) {
       if (ws.reactTimes.length >= 8) return;
       ws.reactTimes.push(now);
       room.reactions[msg.kind] += 1;
+      stats.reactions[msg.kind] = (stats.reactions[msg.kind] || 0) + 1;
+      if (room.source) ensureSession().reactions[msg.kind] += 1;
       broadcast({ type: 'reaction', by, kind: msg.kind, position: currentPosition(), counts: room.reactions });
       saveSoon();
+      saveSoon('stats', 10000);
       break;
     }
 
@@ -898,22 +1239,32 @@ function handleMessage(ws, msg) {
 
 // ───────────────────────── Запуск ─────────────────────────
 
-server.listen(PORT, () => {
-  console.log(`Кинозал запущен: http://localhost:${PORT}`);
-  console.log(`Аккаунты: ${[...USERS.values()].map((u) => `${u.login} (${u.name})`).join(', ')}`);
-  console.log(`YouTube через сервер: ${YTDLP_ENABLED ? 'включён' : 'выключен'}${YTDLP_PROXY ? ', с прокси' : ''}`);
-  console.log(`Загрузка файлов: ${UPLOADS_ENABLED ? `включена, до ${MAX_UPLOAD_MB} МБ` : 'выключена'}`);
-  cleanupMedia().catch(() => {});
-});
+loadAll()
+  .then(() => {
+    server.listen(PORT, () => {
+      console.log(`Кинозал запущен: http://localhost:${PORT}`);
+      console.log(`Аккаунты: ${[...USERS.values()].map((u) => `${u.login} (${u.name})`).join(', ')}`);
+      console.log(`Хранилище: ${store.kind}${store.kind === 'файлы' ? ` (${DATA_DIR})` : ''}`);
+      console.log(`Дневник: ${diary.length} записей, хотелок: ${wishlist.length}`);
+      console.log(`YouTube через сервер: ${YTDLP_ENABLED ? 'включён' : 'выключен'}${YTDLP_PROXY ? ', с прокси' : ''}`);
+      console.log(`Загрузка файлов: ${UPLOADS_ENABLED ? `включена, до ${MAX_UPLOAD_MB} МБ` : 'выключена'}`);
+      cleanupMedia().catch(() => {});
+    });
+  })
+  .catch((e) => {
+    console.error('Не удалось открыть хранилище:', e.message);
+    if (process.env.DATABASE_URL) console.error('Проверь DATABASE_URL — строку подключения к базе (Neon → Connection string).');
+    process.exit(1);
+  });
 
-function shutdown() {
-  clearTimeout(saveTimer);
-  try {
-    fs.writeFileSync(STATE_FILE, JSON.stringify({
-      source: room.source, position: currentPosition(), queue: room.queue, messages: room.messages, reactions: room.reactions,
-    }));
-  } catch { /* ignore */ }
+let shuttingDown = false;
+async function shutdown() {
+  if (shuttingDown) return;
+  shuttingDown = true;
   if (ytJob) ytJob.child.kill('SIGTERM');
+  finalizeSession();
+  const timeout = new Promise((r) => setTimeout(r, 5000));
+  await Promise.race([flushAll(), timeout]);
   process.exit(0);
 }
 process.on('SIGINT', shutdown);

@@ -41,6 +41,7 @@
     up: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m18 15-6-6-6 6"/></svg>',
     down: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>',
     x: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6 6 18"/><path d="M6 6l12 12"/></svg>',
+    toQueue: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h12M3 12h12M3 18h7"/><path d="M18 15v6M15 18h6"/></svg>',
     film: '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="3" width="20" height="18" rx="2"/><path d="M7 3v18M17 3v18M2 9h5M2 15h5M17 9h5M17 15h5"/></svg>',
   };
   const REACT_COLORS = { heart: '#FF7AA8', fire: '#FF9F5A', laugh: '#FFD25A', star: '#8FB8FF', cry: '#7FD6E0' };
@@ -99,6 +100,11 @@
     pendingLocal: null,
     seeking: false,
     unread: 0,
+    diary: [],          // записи дневника, от старых к новым
+    diaryHasMore: false,
+    wishlist: [],
+    stats: null,
+    libTab: 'queue',
   };
 
   const userName = (login) => (S.users.find((u) => u.login === login) || {}).name || login || '';
@@ -171,8 +177,35 @@
       }
       case 'init':
         S.me = msg.me;
+        S.diary = msg.diary || [];
+        S.diaryHasMore = (msg.diaryTotal || 0) > S.diary.length;
+        S.wishlist = msg.wishlist || [];
+        S.stats = msg.stats || null;
         setRoom(msg.state);
         renderAllMessages(msg.messages);
+        renderWishlist();
+        renderDiary();
+        break;
+      case 'wishlist':
+        S.wishlist = msg.items || [];
+        renderWishlist();
+        break;
+      case 'diary_upsert': {
+        const i = S.diary.findIndex((e) => e.id === msg.entry.id);
+        if (i >= 0) S.diary[i] = msg.entry; else S.diary.push(msg.entry);
+        S.stats = msg.stats;
+        renderDiary();
+        break;
+      }
+      case 'diary_remove':
+        S.diary = S.diary.filter((e) => e.id !== msg.id);
+        S.stats = msg.stats;
+        renderDiary();
+        break;
+      case 'diary_older':
+        S.diary = (msg.entries || []).concat(S.diary);
+        S.diaryHasMore = !!msg.hasMore;
+        renderDiary();
         break;
       case 'state':
         setRoom(msg.state);
@@ -309,8 +342,30 @@
     return name || lang || `${fallback} ${i + 1}`;
   }
 
-  // Собирает разделы меню для того, что сейчас играет
+  // Разделы меню: сначала то, что зависит от видео, в конце — общие настройки для двоих
   function settingsSections() {
+    const sections = mediaSections();
+    if (!sections.length) {
+      sections.push({
+        title: 'Настройки видео', items: [],
+        note: player.kind === 'html' && !hls
+          ? 'У этого видео нет дорожек или субтитров, которые видит браузер. Несколько озвучек в файле умеет показывать только Safari.'
+          : 'У этого видео нет своих настроек.',
+      });
+    }
+    const wait = !(S.room && S.room.settings && S.room.settings.waitForBuffer === false);
+    sections.push({
+      title: 'Вместе',
+      items: [{
+        label: 'Ждать, если у кого-то грузится', checked: wait, role: 'menuitemcheckbox',
+        pick: () => send({ type: 'settings', waitForBuffer: !wait }),
+      }],
+      note: 'Если видео у кого-то подвисло, пауза ставится обоим и включается само, когда догрузится. Общая настройка — меняется у вас обоих.',
+    });
+    return sections;
+  }
+
+  function mediaSections() {
     const sections = [];
     const src = S.room && S.room.source;
     if (!src) return sections;
@@ -426,17 +481,11 @@
       nodes.push(h('div', { class: 'cc-title' }, sec.title));
       for (const it of sec.items) {
         nodes.push(h('button', {
-          type: 'button', class: 'cc-item', role: 'menuitemradio', 'aria-checked': String(!!it.checked),
+          type: 'button', class: 'cc-item', role: it.role || 'menuitemradio', 'aria-checked': String(!!it.checked),
           onclick: () => { it.pick(); setTimeout(renderSettingsMenu, 150); },
         }, it.label));
       }
       if (sec.note) nodes.push(h('div', { class: 'cc-note' }, sec.note));
-    }
-    if (!sections.length) {
-      nodes.push(h('div', { class: 'cc-title' }, 'Настройки видео'));
-      nodes.push(h('div', { class: 'cc-note' }, player.kind === 'html' && !hls
-        ? 'У этого видео нет дорожек или субтитров, которые видит браузер. Если в файле есть несколько озвучек, их может показать только Safari — или выбери озвучку при скачивании.'
-        : 'У этого видео нет дополнительных настроек.'));
     }
     menu.replaceChildren(...nodes);
   }
@@ -748,6 +797,75 @@
     if (Math.abs(diff) > tolerance && !S.seeking) player.seek(target);
   }
   setInterval(syncTick, 500);
+
+  // ── «Подожди меня»: если видео у меня подвисло — просим сервер поставить паузу обоим ──
+  const buf = { sent: false, sid: null, stallSince: 0 };
+
+  function bufferedAhead() {
+    const t = video.currentTime;
+    const b = video.buffered;
+    for (let i = 0; i < b.length; i++) {
+      if (b.start(i) <= t + 0.3 && b.end(i) >= t) return b.end(i) - t;
+    }
+    return 0;
+  }
+
+  function mediaStalled() {
+    if (player.kind === 'html') return !video.paused && video.readyState < 3;
+    if (player.kind === 'yt' && yt.ready) {
+      try { return yt.player.getPlayerState() === 3; } catch { return false; }
+    }
+    return false;
+  }
+
+  function mediaReadyEnough() {
+    if (player.kind === 'html') {
+      const left = (video.duration || 0) - video.currentTime;
+      return video.readyState >= 4 || bufferedAhead() >= 4 || (left > 0 && left < 4 && video.readyState >= 3);
+    }
+    if (player.kind === 'yt' && yt.ready) {
+      try {
+        const frac = yt.player.getVideoLoadedFraction() || 0;
+        const dur = yt.player.getDuration() || 0;
+        return frac >= 0.99 || frac * dur - yt.player.getCurrentTime() >= 4;
+      } catch { return true; }
+    }
+    return true;
+  }
+
+  function sendBuffering(on, sid) {
+    buf.sent = on;
+    buf.sid = on ? sid : null;
+    buf.stallSince = 0;
+    send({ type: 'buffering', on, sid });
+  }
+
+  setInterval(() => {
+    const r = S.room;
+    const src = r && r.source;
+    if (!src || !S.mediaReady || !S.joined || !S.connected) {
+      if (buf.sent && src) sendBuffering(false, buf.sid);
+      buf.sent = false;
+      buf.stallSince = 0;
+      return;
+    }
+    if (buf.sent && buf.sid !== src.sid) { buf.sent = false; buf.sid = null; } // видео сменилось — сервер уже забыл
+
+    if (!buf.sent) {
+      const wanted = !(r.settings && r.settings.waitForBuffer === false);
+      if (wanted && r.playing && mediaStalled()) {
+        if (!buf.stallSince) buf.stallSince = Date.now();
+        else if (Date.now() - buf.stallSince > 1500) sendBuffering(true, src.sid);
+      } else {
+        buf.stallSince = 0;
+      }
+      return;
+    }
+    // уже попросили подождать: сообщаем, когда догрузилось (или если кто-то нажал плей сам)
+    if ((r.playing && !r.waiting && !mediaStalled()) || (!r.playing && mediaReadyEnough())) {
+      sendBuffering(false, src.sid);
+    }
+  }, 500);
 
   // ───────────────────────── Действия ─────────────────────────
 
@@ -1161,6 +1279,8 @@
     renderQueue();
     renderReactions();
     renderOverlay();
+    renderPresence();
+    renderSettingsMenu();
     syncTick();
   }
 
@@ -1186,8 +1306,11 @@
 
     const dot = $('syncDot');
     dot.className = 'dot ' + (!S.connected ? 'bad' : pOn ? 'ok' : 'warn');
+    const waiting = S.connected && S.room && S.room.waiting;
+    dot.className = 'dot ' + (!S.connected ? 'bad' : waiting ? 'warn' : pOn ? 'ok' : 'warn');
     $('syncText').textContent = !S.connected ? 'Нет связи'
-      : pOn ? `Синхронно с ${p ? p.name : 'вторым'}` : 'Ждём второго';
+      : waiting ? 'Ждём, пока догрузится…'
+        : pOn ? `Синхронно с ${p ? p.name : 'вторым'}` : 'Ждём второго';
   }
 
   function hostOf(url) {
@@ -1232,6 +1355,10 @@
         pause: `${who(la.by)} — пауза на ${fmtTime(la.position)}`,
         seek: `${who(la.by)} — перемотка на ${fmtTime(la.position)}`,
         load: `${who(la.by)} — включено новое видео`,
+        wait: isMe(la.by) ? 'У тебя грузится — ждём, пока догрузится' : `${userName(la.by)}: видео грузится — ждём`,
+        resume: la.by ? 'Догрузилось — продолжаем' : 'Ждали долго — продолжаем',
+        wait_on: `${who(la.by)} — «ждать, если грузится»: включено`,
+        wait_off: `${who(la.by)} — «ждать, если грузится»: выключено`,
       }[la.action] || '';
       $('lastAction').textContent = text;
     } else {
@@ -1272,7 +1399,7 @@
 
   function renderQueue() {
     const q = (S.room && S.room.queue) || [];
-    $('queueCount').textContent = `· ${q.length}`;
+    $('queueCount').textContent = String(q.length);
     $('queueEmpty').hidden = q.length > 0;
     $('queueList').replaceChildren(...q.map((item, i) => {
       const src = item.source;
@@ -1294,6 +1421,222 @@
           h('button', { type: 'button', class: 'icon-btn', 'aria-label': 'Убрать из очереди', onclick: () => send({ type: 'queue_remove', id: item.id }) }, svg(ICONS.x))));
     }));
   }
+
+  // ───────────────────────── Очередь · Хотелки · Дневник ─────────────────────────
+
+  const LIB = { queue: ['libTabQueue', 'libQueue'], wish: ['libTabWish', 'libWish'], diary: ['libTabDiary', 'libDiary'] };
+  function setLibTab(tab) {
+    if (!LIB[tab]) tab = 'queue';
+    S.libTab = tab;
+    for (const [name, [tabId, panelId]] of Object.entries(LIB)) {
+      $(tabId).setAttribute('aria-selected', String(name === tab));
+      $(panelId).hidden = name !== tab;
+    }
+    store.set('kz_libtab', tab);
+  }
+  for (const [name, [tabId]] of Object.entries(LIB)) $(tabId).addEventListener('click', () => setLibTab(name));
+
+  function thumbFor(src) {
+    const thumb = h('div', { class: 'q-thumb' }, svg(ICONS.film));
+    if ((src.kind === 'youtube' || src.kind === 'proxy') && /^[A-Za-z0-9_-]{11}$/.test(src.ref)) {
+      const img = h('img', { src: `https://i.ytimg.com/vi/${src.ref}/mqdefault.jpg`, alt: '', loading: 'lazy' });
+      img.addEventListener('load', () => thumb.replaceChildren(img));
+    }
+    return thumb;
+  }
+
+  const MONTHS = ['января', 'февраля', 'марта', 'апреля', 'мая', 'июня', 'июля', 'августа', 'сентября', 'октября', 'ноября', 'декабря'];
+  function fmtDate(ms, withYear) {
+    const d = new Date(ms);
+    const y = withYear || d.getFullYear() !== new Date().getFullYear() ? ` ${d.getFullYear()}` : '';
+    return `${d.getDate()} ${MONTHS[d.getMonth()]}${y}`;
+  }
+  function dayLabel(ms) {
+    const d = new Date(ms);
+    const today = new Date();
+    const yest = new Date(Date.now() - 864e5);
+    const same = (a, b) => a.toDateString() === b.toDateString();
+    if (same(d, today)) return 'Сегодня';
+    if (same(d, yest)) return 'Вчера';
+    return fmtDate(ms);
+  }
+  function fmtDuration(sec) {
+    sec = Math.round(sec || 0);
+    const hh = Math.floor(sec / 3600);
+    const mm = Math.floor((sec % 3600) / 60);
+    if (hh && mm) return `${hh} ч ${mm} мин`;
+    if (hh) return `${hh} ч`;
+    return `${Math.max(1, mm)} мин`;
+  }
+  function plural(n, one, few, many) {
+    const a = Math.abs(n) % 100;
+    const b = a % 10;
+    if (a > 10 && a < 20) return many;
+    if (b === 1) return one;
+    if (b >= 2 && b <= 4) return few;
+    return many;
+  }
+  function smallIcon(kind) {
+    const el = svg(ICONS[kind]);
+    el.setAttribute('width', '15');
+    el.setAttribute('height', '15');
+    return el;
+  }
+
+  // Ссылка из поля «хотелок» → источник видео
+  function sourceFromLink(raw) {
+    const u = normalizeUrl(raw);
+    if (!u) return null;
+    const ytId = parseYouTube(u.href);
+    if (ytId) return { kind: 'youtube', ref: ytId };
+    if (!VIDEO_FILE_RE.test(u.pathname + u.search) && S.features.ytdlp) return { kind: 'site', ref: u.href };
+    return { kind: 'url', ref: u.href };
+  }
+
+  // ── Хотелки ──
+
+  $('wishForm').addEventListener('submit', (e) => {
+    e.preventDefault();
+    const input = $('wishUrl');
+    const src = sourceFromLink(input.value);
+    if (!src) {
+      input.setCustomValidity('Нужна ссылка, например https://youtu.be/…');
+      input.reportValidity();
+      setTimeout(() => input.setCustomValidity(''), 2000);
+      return;
+    }
+    send({ type: 'wish_add', source: src, note: $('wishNote').value.trim() });
+    input.value = '';
+    $('wishNote').value = '';
+  });
+
+  function renderWishlist() {
+    const list = S.wishlist || [];
+    $('wishCount').textContent = String(list.length);
+    $('wishEmpty').hidden = list.length > 0;
+    $('wishList').replaceChildren(...list.map((item) => {
+      const src = item.source;
+      return h('li', { class: 'q-item' },
+        thumbFor(src),
+        h('div', { class: 'q-info' },
+          h('div', { class: 'q-title' }, sourceTitle(src)),
+          item.note ? h('div', { class: 'q-note' }, `«${item.note}»`) : null,
+          h('div', { class: 'q-meta' }, `${isMe(item.by) ? 'Ты' : userName(item.by)} · ${fmtDate(item.at)} · ${sourceLabel(src)}`)),
+        h('div', { class: 'q-actions' },
+          h('button', { type: 'button', class: 'icon-btn', 'aria-label': 'Смотреть сейчас', title: 'Смотреть сейчас', onclick: () => { if (!S.joined) join(); send({ type: 'wish_play', id: item.id }); } }, svg(ICONS.play)),
+          h('button', { type: 'button', class: 'icon-btn', 'aria-label': 'В очередь', title: 'В очередь', onclick: () => send({ type: 'wish_queue', id: item.id }) }, svg(ICONS.toQueue)),
+          h('button', { type: 'button', class: 'icon-btn', 'aria-label': 'Убрать из хотелок', title: 'Убрать', onclick: () => send({ type: 'wish_remove', id: item.id }) }, svg(ICONS.x))));
+    }));
+  }
+
+  // ── Дневник и счётчики ──
+
+  let editingNote = null; // id записи, к которой сейчас пишем пару слов
+
+  function statTile(label, value, sub) {
+    return h('div', { class: 'stat' },
+      h('div', { class: 'stat-label' }, label),
+      h('div', { class: 'stat-value' }, value),
+      sub ? h('div', { class: 'stat-sub' }, sub) : null);
+  }
+
+  function renderStats() {
+    const st = S.stats;
+    const box = $('statsBox');
+    if (!st || (!st.together && !st.videos)) { box.replaceChildren(); box.hidden = true; return; }
+    box.hidden = false;
+    const r = st.reactions || {};
+    const totalReacts = Object.values(r).reduce((a, b) => a + (b || 0), 0);
+    box.replaceChildren(
+      statTile('Вместе посмотрели', fmtDuration(st.together), st.firstAt ? `с ${fmtDate(st.firstAt, true)}` : null),
+      statTile('Видео', `${st.videos}`, plural(st.videos, 'видео в дневнике', 'видео в дневнике', 'видео в дневнике')),
+      statTile('Сердечек', `${r.heart || 0}`, `всего реакций: ${totalReacts}`),
+      statTile('Самое смешное', st.funniest ? st.funniest.title || 'Без названия' : 'пока нет',
+        st.funniest ? `${st.funniest.count} ${plural(st.funniest.count, 'смешок', 'смешка', 'смешков')}` : 'жмите «смешно» почаще'),
+      statTile('Самое любимое', st.loved ? st.loved.title || 'Без названия' : 'пока нет',
+        st.loved ? `${st.loved.count} ${plural(st.loved.count, 'сердечко', 'сердечка', 'сердечек')}` : null),
+    );
+  }
+
+  function diaryItem(e) {
+    const reacts = ['heart', 'laugh', 'fire', 'star', 'cry'].filter((k) => (e.reactions && e.reactions[k]) > 0);
+    const notes = Object.entries(e.notes || {}).filter(([, t]) => t);
+    const myNote = (e.notes || {})[S.me] || '';
+    const editing = editingNote === e.id;
+
+    let noteForm = null;
+    if (editing) {
+      const input = h('input', { class: 'input grow', type: 'text', maxlength: '500', value: myNote, placeholder: 'Пару слов об этом вечере…', 'aria-label': 'Пару слов' });
+      const save = () => { send({ type: 'diary_note', id: e.id, text: input.value.trim() }); editingNote = null; renderDiary(); };
+      input.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') save(); if (ev.key === 'Escape') { editingNote = null; renderDiary(); } });
+      noteForm = h('div', { class: 'note-form' }, input,
+        h('button', { type: 'button', class: 'btn', onclick: save }, 'Сохранить'),
+        h('button', { type: 'button', class: 'btn btn-ghost', onclick: () => { editingNote = null; renderDiary(); } }, 'Отмена'));
+      setTimeout(() => input.focus(), 0);
+    }
+
+    return h('div', { class: 'd-item' },
+      thumbFor(e),
+      h('div', { class: 'q-info' },
+        h('div', { class: 'q-title' }, e.title || sourceTitle(e)),
+        h('div', { class: 'd-meta' },
+          h('span', {}, `${fmtDuration(e.together)} вместе · ${fmtClock(e.startedAt)}`),
+          ...reacts.map((k) => {
+            const chip = h('span', { class: 'd-react', title: { heart: 'Сердечки', laugh: 'Смешно', fire: 'Огонь', star: 'Звёзды', cry: 'Грустно' }[k] }, smallIcon(k), String(e.reactions[k]));
+            chip.style.setProperty('--c', REACT_COLORS[k]);
+            return chip;
+          })),
+        ...notes.map(([login, text]) => h('div', { class: 'd-note' }, h('b', {}, `${isMe(login) ? 'Ты' : userName(login)}: `), text)),
+        noteForm,
+        editing ? null : h('div', { class: 'd-actions' },
+          h('button', { type: 'button', class: 'link-btn', onclick: () => { editingNote = e.id; renderDiary(); } }, myNote ? 'Изменить свои слова' : 'Пару слов'),
+          e.rewatch ? h('button', { type: 'button', class: 'link-btn', onclick: () => { if (!S.joined) join(); send({ type: 'diary_rewatch', id: e.id }); } }, 'Посмотреть ещё раз') : null,
+          h('button', { type: 'button', class: 'link-btn danger', onclick: () => { if (confirm(`Убрать «${e.title || 'это видео'}» из дневника?`)) send({ type: 'diary_delete', id: e.id }); } }, 'Убрать'))));
+  }
+
+  function renderDiary() {
+    renderStats();
+    const list = (S.diary || []).slice().reverse(); // новые сверху
+    $('diaryEmpty').hidden = list.length > 0;
+    $('diaryMore').hidden = !S.diaryHasMore;
+    const nodes = [];
+    let lastDay = null;
+    for (const e of list) {
+      const day = dayLabel(e.startedAt);
+      if (day !== lastDay) { nodes.push(h('div', { class: 'd-day' }, day)); lastDay = day; }
+      nodes.push(diaryItem(e));
+    }
+    $('diaryList').replaceChildren(...nodes);
+  }
+
+  $('diaryMore').addEventListener('click', () => {
+    if (S.diary.length) send({ type: 'diary_more', before: S.diary[0].id });
+  });
+
+  // ── Темы ──
+
+  function renderThemeMenu() {
+    const menu = $('themeMenu');
+    if (menu.hidden || !window.KZTheme) return;
+    const choice = window.KZTheme.choice();
+    menu.replaceChildren(
+      h('div', { class: 'cc-title' }, 'Тема — только у тебя'),
+      ...window.KZTheme.list.map((t) => h('button', {
+        type: 'button', class: 'cc-item', role: 'menuitemradio', 'aria-checked': String(choice === t.id),
+        onclick: () => { window.KZTheme.set(t.id); renderThemeMenu(); },
+      }, h('span', { class: `swatch sw-${t.id}`, 'aria-hidden': 'true' }), h('span', {}, t.name, h('span', { class: 'cc-hint' }, t.hint)))),
+    );
+  }
+  function closeThemeMenu() { $('themeMenu').hidden = true; $('themeBtn').setAttribute('aria-expanded', 'false'); }
+  $('themeBtn').addEventListener('click', (e) => {
+    e.stopPropagation();
+    const menu = $('themeMenu');
+    menu.hidden = !menu.hidden;
+    $('themeBtn').setAttribute('aria-expanded', String(!menu.hidden));
+    renderThemeMenu();
+  });
+  document.addEventListener('click', (e) => { if (!$('themeMenu').hidden && !$('themeWrap').contains(e.target)) closeThemeMenu(); });
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !$('themeMenu').hidden) { closeThemeMenu(); $('themeBtn').focus(); } });
 
   function renderOverlay() {
     const box = $('overlay');
@@ -1366,6 +1709,7 @@
 
   async function start() {
     setTab(store.get('kz_tab', 'yt'));
+    setLibTab(store.get('kz_libtab', 'queue'));
     try {
       const r = await fetch('/api/me', { cache: 'no-store' });
       if (r.status === 401) { location.href = '/login'; return; }

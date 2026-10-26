@@ -211,6 +211,8 @@ app.use((req, res, next) => {
 const PUBLIC_DIR = path.join(__dirname, 'public');
 
 app.get('/robots.txt', (req, res) => res.type('text/plain').send('User-agent: *\nDisallow: /\n'));
+// браузеры сами ищут /favicon.ico — отдаём наш значок без входа
+app.get('/favicon.ico', (req, res) => res.redirect(301, '/assets/favicon-32.png'));
 app.use('/assets', express.static(path.join(PUBLIC_DIR, 'assets'), { maxAge: '1h' }));
 
 app.get('/login', (req, res) => {
